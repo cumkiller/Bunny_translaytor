@@ -1,26 +1,8 @@
+```javascript
 (function () {
     "use strict";
 
-    const { metro, patcher, plugin, ui, commands, logger } = window.vendetta;
-    const { findByProps, findByStoreName } = metro;
-    const { FluxDispatcher, React, ReactNative } = metro.common;
-    const { before, after } = patcher;
-    const { storage } = plugin;
-    const { showToast } = ui.toasts;
-    const { Forms } = ui.components;
-    const { FormSwitchRow, FormInput, FormSection, FormDivider } = Forms;
-
-    storage.autoTranslate ??= true;
-    storage.useSlangDict ??= true;
-    storage.showOriginal ??= true;
-    storage.ignoreOwnMessages ??= true;
-    storage.useGemini ??= false;
-    storage.geminiApiKey ??= "";
-
-    const MessageStore = findByStoreName("MessageStore");
-    const UserStore = findByStoreName("UserStore");
-    const ActionSheet = findByProps("openLazy", "hideActionSheet");
-
+    const v = typeof vendetta !== "undefined" ? vendetta : window.vendetta;
     const translatedCache = new Map();
     const pendingIds = new Set();
     let patches = [];
@@ -39,7 +21,7 @@
         [/\bwe are cooked\b/gi, "нам конец"],
         [/\bwe'?re cooked\b/gi, "нам конец"],
         [/\bi'?m cooked\b/gi, "мне конец"],
-        [/\bskill issue\b/gi, "руки не из того места"],
+        [/\bskill issue\b/gi, "проблема со скиллом"],
         [/\bon god\b/gi, "клянусь"],
         [/\bmy bad\b/gi, "мой косяк"],
         [/\bhit me up\b/gi, "напиши мне"]
@@ -62,34 +44,18 @@
 
     function shouldTranslate(text) {
         if (!text || typeof text !== "string") return false;
-        const clean = text.replace(/<a?:[a-zA-Z0-9_]+:\d+>/g, "").replace(/<[@#&!]\d+>/g, "").replace(/https?:\/\/\S+/g, "").trim();
+        const clean = text
+            .replace(/<a?:[a-zA-Z0-9_]+:\d+>/g, "")
+            .replace(/<[@#&!]\d+>/g, "")
+            .replace(/https?:\/\/\S+/g, "")
+            .trim();
         if (clean.length < 2) return false;
         const latinCount = (clean.match(/[a-zA-Z]/g) || []).length;
         const cyrillicCount = (clean.match(/[а-яА-ЯёЁ]/g) || []).length;
         return latinCount > 0 && cyrillicCount <= latinCount * 2;
     }
 
-    function protectDiscordTokens(text) {
-        const tokens = [];
-        const tokenRegex = /(```[\s\S]*?```|`[^`\n]+`|<a?:[a-zA-Z0-9_]+:\d+>|<[@#&!]\d+>|https?:\/\/\S+)/g;
-        const protectedText = text.replace(tokenRegex, (match) => {
-            const idx = tokens.length;
-            tokens.push(match);
-            return `[#${idx}#]`;
-        });
-        return { protectedText, tokens };
-    }
-
-    function restoreDiscordTokens(text, tokens) {
-        let restored = text;
-        tokens.forEach((token, idx) => {
-            restored = restored.replace(new RegExp(`\\[#\\s*${idx}\\s*#\\]`, "g"), token);
-        });
-        return restored;
-    }
-
     function preprocessSlang(text) {
-        if (!storage.useSlangDict) return text;
         let result = text;
         for (const [regex, replacement] of PHRASE_SLANG) {
             result = result.replace(regex, replacement);
@@ -100,112 +66,91 @@
         });
     }
 
-    async function translateWithGoogle(text) {
-        const prepared = preprocessSlang(text);
+    async function translateText(rawText) {
+        const tokens = [];
+        const tokenRegex = /(```[\s\S]*?```|`[^`\n]+`|<a?:[a-zA-Z0-9_]+:\d+>|<[@#&!]\d+>|https?:\/\/\S+)/g;
+        const protectedText = rawText.replace(tokenRegex, (match) => {
+            const idx = tokens.length;
+            tokens.push(match);
+            return `[#${idx}#]`;
+        });
+
+        const prepared = preprocessSlang(protectedText);
         const url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=ru&dt=t&q=" + encodeURIComponent(prepared);
         const response = await fetch(url);
-        if (!response.ok) throw new Error("Translation failed");
         const data = await response.json();
-        return data[0].map((part) => part[0]).join("");
-    }
+        let translated = data[0].map((part) => part[0]).join("");
 
-    async function translateText(rawText) {
-        const { protectedText, tokens } = protectDiscordTokens(rawText);
-        const translated = await translateWithGoogle(protectedText);
-        return restoreDiscordTokens(translated, tokens);
-    }
-
-    function applyTranslationToMessage(channelId, messageId, originalContent, translatedContent) {
-        const currentMsg = MessageStore?.getMessage?.(channelId, messageId);
-        if (!currentMsg) return;
-        const formatted = storage.showOriginal ? `${translatedContent}\n-# 🇬🇧 ${originalContent}` : translatedContent;
-        FluxDispatcher.dispatch({
-            type: "MESSAGE_UPDATE",
-            message: { ...currentMsg, id: messageId, channel_id: channelId, content: formatted }
+        tokens.forEach((token, idx) => {
+            translated = translated.replace(new RegExp(`\\[#\\s*${idx}\\s*#\\]`, "g"), token);
         });
-    }
-
-    async function processMessage(msg, force = false) {
-        if (!msg?.id || !msg?.channel_id || !msg?.content) return;
-        if (pendingIds.has(msg.id) || msg.content.includes("\n-# 🇬🇧 ")) return;
-        const currentUserId = UserStore?.getCurrentUser?.()?.id;
-        if (!force && storage.ignoreOwnMessages && msg.author?.id === currentUserId) return;
-        if (!force && !shouldTranslate(msg.content)) return;
-
-        if (translatedCache.has(msg.id)) {
-            const cached = translatedCache.get(msg.id);
-            applyTranslationToMessage(msg.channel_id, msg.id, cached.original, cached.translated);
-            return;
-        }
-
-        pendingIds.add(msg.id);
-        try {
-            const original = msg.content;
-            const translated = await translateText(original);
-            if (translated && translated.trim().toLowerCase() !== original.trim().toLowerCase()) {
-                translatedCache.set(msg.id, { original, translated });
-                applyTranslationToMessage(msg.channel_id, msg.id, original, translated);
-            }
-        } catch (err) {
-            logger.error("Translate error:", err);
-        } finally {
-            pendingIds.delete(msg.id);
-        }
-    }
-
-    function setupDispatcherHooks() {
-        const onMessageCreate = (event) => {
-            if (!storage.autoTranslate) return;
-            const msg = event?.message;
-            if (msg) setTimeout(() => processMessage(msg, false), 150);
-        };
-        const onLoadMessages = (event) => {
-            if (!storage.autoTranslate) return;
-            event?.messages?.slice(0, 15).forEach((msg, idx) => {
-                setTimeout(() => processMessage(msg, false), 200 * (idx + 1));
-            });
-        };
-        FluxDispatcher.subscribe("MESSAGE_CREATE", onMessageCreate);
-        FluxDispatcher.subscribe("LOAD_MESSAGES_SUCCESS", onLoadMessages);
-        patches.push(() => {
-            FluxDispatcher.unsubscribe("MESSAGE_CREATE", onMessageCreate);
-            FluxDispatcher.unsubscribe("LOAD_MESSAGES_SUCCESS", onLoadMessages);
-        });
-    }
-
-    function setupSlashCommand() {
-        if (!commands?.registerCommand) return;
-        const unregister = commands.registerCommand({
-            name: "tr",
-            displayName: "tr",
-            description: "Перевести текст со сленгом на русский",
-            displayDescription: "Перевести текст со сленгом на русский",
-            options: [{ name: "text", displayName: "text", description: "Текст", displayDescription: "Текст", required: true, type: 3 }],
-            applicationId: "-1",
-            inputType: 1,
-            type: 1,
-            execute: async (args) => {
-                const input = args?.[0]?.value || "";
-                try {
-                    const result = await translateText(input);
-                    return { content: `🌐 **Перевод:** ${result}\n-# Оригинал: ${input}` };
-                } catch {
-                    showToast("Ошибка перевода");
-                }
-            }
-        });
-        patches.push(unregister);
+        return translated;
     }
 
     return {
         onLoad() {
-            setupDispatcherHooks();
-            setupSlashCommand();
-            logger.log("RU Slang Translator loaded");
+            try {
+                const FluxDispatcher = v?.metro?.common?.FluxDispatcher || v?.metro?.findByProps?.("dispatch", "subscribe");
+                const MessageStore = v?.metro?.findByStoreName?.("MessageStore");
+                const UserStore = v?.metro?.findByStoreName?.("UserStore");
+
+                if (!FluxDispatcher) return;
+
+                async function processMessage(msg) {
+                    try {
+                        if (!msg?.id || !msg?.channel_id || !msg?.content) return;
+                        if (pendingIds.has(msg.id) || msg.content.includes("\n-# 🇬🇧 ")) return;
+
+                        const currentUserId = UserStore?.getCurrentUser?.()?.id;
+                        if (currentUserId && msg.author?.id === currentUserId) return;
+                        if (!shouldTranslate(msg.content)) return;
+
+                        pendingIds.add(msg.id);
+                        const original = msg.content;
+                        const translated = await translateText(original);
+
+                        if (translated && translated.trim().toLowerCase() !== original.trim().toLowerCase()) {
+                            const currentMsg = MessageStore?.getMessage?.(msg.channel_id, msg.id) || msg;
+                            FluxDispatcher.dispatch({
+                                type: "MESSAGE_UPDATE",
+                                message: {
+                                    ...currentMsg,
+                                    id: msg.id,
+                                    channel_id: msg.channel_id,
+                                    content: `${translated}\n-# 🇬🇧 ${original}`
+                                }
+                            });
+                        }
+                    } catch (e) {
+                    } finally {
+                        if (msg?.id) pendingIds.delete(msg.id);
+                    }
+                }
+
+                const onMessageCreate = (event) => {
+                    if (event?.message) setTimeout(() => processMessage(event.message), 150);
+                };
+
+                const onLoadMessages = (event) => {
+                    if (Array.isArray(event?.messages)) {
+                        event.messages.slice(0, 15).forEach((m, i) => {
+                            setTimeout(() => processMessage(m), 200 * (i + 1));
+                        });
+                    }
+                };
+
+                FluxDispatcher.subscribe("MESSAGE_CREATE", onMessageCreate);
+                FluxDispatcher.subscribe("LOAD_MESSAGES_SUCCESS", onLoadMessages);
+
+                patches.push(() => {
+                    FluxDispatcher.unsubscribe("MESSAGE_CREATE", onMessageCreate);
+                    FluxDispatcher.unsubscribe("LOAD_MESSAGES_SUCCESS", onLoadMessages);
+                });
+            } catch (e) {}
         },
         onUnload() {
-            patches.forEach((unpatch) => {
-                try { unpatch(); } catch {}
+            patches.forEach((fn) => {
+                try { fn(); } catch (e) {}
             });
             patches = [];
             translatedCache.clear();
@@ -213,3 +158,4 @@
         }
     };
 })();
+```
