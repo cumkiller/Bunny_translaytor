@@ -1,6 +1,6 @@
 {
   "name": "RU Slang Translator",
-  "description": "Автоматический перевод всех сообщений Discord на русский язык с поддержкой английского сленга и Gemini AI.",
+  "description": "Автоматический перевод всех сообщений Discord на русский со сленгом",
   "authors": [
     {
       "name": "Custom",
@@ -10,5 +10,6 @@
   "main": "index.js",
   "vendetta": {
     "icon": "ic_locale_24px"
-  }
+  },
+  "hash": "adc9323078569af080314032a677d4bb41db3a01c85958c21c72d6382d37a236"
 }
